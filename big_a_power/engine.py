@@ -8,11 +8,35 @@
 """
 from __future__ import annotations
 
+import hashlib
 import numpy as np
 import pandas as pd
 
 MIN_ABS = 18
 SELL_TH = 1
+
+# ── 指标缓存(内存, 自包含) ────────────────────────────────────────────────
+_INDICATOR_CACHE = {}
+
+
+def _kl_key(kl: np.ndarray) -> str:
+    return hashlib.sha1(np.ascontiguousarray(kl, dtype=np.float64).tobytes()).hexdigest()
+
+
+def _cached_indicators(kl: np.ndarray):
+    """指标缓存：同 K线只算一次 compute_indicators，后续复用。"""
+    key = _kl_key(kl)
+    if key in _INDICATOR_CACHE:
+        return _INDICATOR_CACHE[key]
+    if len(_INDICATOR_CACHE) > 2000:
+        _INDICATOR_CACHE.clear()
+    R = compute_indicators(kl)
+    _INDICATOR_CACHE[key] = R
+    return R
+
+
+def clear_indicator_cache():
+    _INDICATOR_CACHE.clear()
 
 # ── 矢量化指标原语（无未来函数） ──
 def _sma(x, n):
@@ -360,10 +384,63 @@ def group_score(sigs, names, min_abs=MIN_ABS):
 
 
 def compute_groups(kl, min_abs=MIN_ABS):
-    R = compute_indicators(kl)
+    R = _cached_indicators(kl)
     sigs = make_sig(R)
     gs = {g: group_score(sigs, names, min_abs) for g, names in GROUPS.items()}
     return gs
+
+
+# ── 两段式引擎接口（供 engine_iter 加速迭代） ──────────────────────────────
+_SIGS_CACHE = {}
+
+
+def _make_sig_cached(R):
+    """缓存 make_sig(R)：R(指标)固定→sigs(17信号)固定，不随 min_abs 变。"""
+    key = id(R)
+    if key in _SIGS_CACHE:
+        return _SIGS_CACHE[key]
+    sigs = make_sig(R)
+    _SIGS_CACHE[key] = sigs
+    return sigs
+
+
+def signal_from_R(R, min_abs=MIN_ABS, sell_th=SELL_TH, dd_n=0):
+    """从缓存的指标 R 直接出信号（依赖参数, 毫秒级, 不重算指标/信号）。
+
+    指标 R 和 17信号 make_sig(R) 都不依赖 min_abs/sell_th → 缓存；
+    只有 group_score/net/signal_gate 依赖参数 → 毫秒级重算。
+    复刻原版 signal_gate_trmob：返回【连续幅值】(趋势组原始 -100~100)，
+    不压缩到 ±50（保留信号强弱区分度，回测用 th=25 判定买卖）。
+    """
+    sigs = _make_sig_cached(R)
+    gs = {g: group_score(sigs, names, min_abs) for g, names in GROUPS.items()}
+    trend = gs["趋势组"]
+    s = trend.copy()
+    net = _net(gs, ["趋势组", "动量组"], min_abs)
+    s[net < sell_th] = 0.0
+    # 净票转空卖出用【原始趋势组】判断(main已被清0,用它判断会恒False丢卖出)
+    negmask = (net <= -sell_th) & (trend < 0)
+    s[negmask] = -np.abs(trend[negmask])
+    if dd_n > 0:
+        c = R["close"]
+        rm = pd.Series(c).rolling(dd_n).min().to_numpy()
+        # 对齐长度（c/rm 可能与 s 不同长，补齐到 s 长度）
+        if len(rm) != len(s):
+            rm = rm[:len(s)] if len(rm) > len(s) else np.pad(rm, (0, len(s) - len(rm)), constant_values=np.nan)
+            c = c[:len(s)] if len(c) > len(s) else np.pad(c, (0, len(s) - len(c)), constant_values=np.nan)
+        s = s.copy(); s[c <= rm] = -np.abs(s[c <= rm])  # 跌破N日新低强制卖出(负向)
+    return s
+
+
+# 导出两段式接口（engine_iter 识别用）
+engine_fn_attrs = {"compute_indicators": staticmethod(compute_indicators),
+                   "signal_from_R": staticmethod(signal_from_R)}
+
+
+def __getattr__(name):
+    if name in engine_fn_attrs:
+        return engine_fn_attrs[name]
+    raise AttributeError(f"module/engine has no attr {name}")
 
 
 def _net(gs, groups, min_abs=MIN_ABS):
