@@ -12,8 +12,8 @@ import hashlib
 import numpy as np
 import pandas as pd
 
-MIN_ABS = 18
-SELL_TH = 1
+MIN_ABS = 10
+SELL_TH = 2
 
 # ── 指标缓存(内存, 自包含) ────────────────────────────────────────────────
 _INDICATOR_CACHE = {}
